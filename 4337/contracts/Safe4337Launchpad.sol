@@ -4,73 +4,47 @@ pragma solidity >=0.8.0 <0.9.0;
 import {IAccount} from "@account-abstraction/contracts/interfaces/IAccount.sol";
 import {UserOperation} from "@account-abstraction/contracts/interfaces/UserOperation.sol";
 import {_packValidationData} from "@account-abstraction/contracts/core/Helpers.sol";
+import {ISignatureValidator} from "@safe-global/safe-contracts/contracts/interfaces/ISignatureValidator.sol";
 import {SafeStorage} from "@safe-global/safe-contracts/contracts/libraries/SafeStorage.sol";
 import {ISafe} from "./interfaces/Safe.sol";
+import {IUniqueSignerFactory} from "./interfaces/UniqueSignerFactory.sol";
 
 /**
- * @title SafeLaunchpad - A contract for complex Safe initialization to enable setups that would violate ERC-4337 factory rules.
+ * @title SafeLaunchpad - A contract for deferred Safe initialization with deployed signer contracts which would violate ERC-4337 factory rules.
  * @dev The is intended to be set as a Safe proxy's implementation for ERC-4337 user operation that deploys the account.
  */
 contract Safe4337Launchpad is IAccount, SafeStorage {
     bytes32 private constant DOMAIN_SEPARATOR_TYPEHASH = keccak256("EIP712Domain(uint256 chainId,address verifyingContract)");
 
-    // keccak256("SafeLaunchpad.initHash") - 1
-    uint256 private constant INIT_HASH_SLOT = 0xfe39743d5545ae15debabf80f9f105bde089b80c1c186c0fa4eb78349b870a8b;
+    // keccak256("Safe4337Launchpad.initHash") - 1
+    uint256 private constant INIT_HASH_SLOT = 0xcdc7df0b1b890a6a8876b3e00beaf76716a03a022e18c92e93dd0d08eb472b74;
 
     /**
-     * @notice The keccak256 hash of the EIP-712 SafeInit struct, representing the structure of a ERC-4337 compatible Safe initialization.
+     * @notice The keccak256 hash of the EIP-712 SafeInit struct, representing the structure of a ERC-4337 compatible deferred Safe initialization.
      *  {address} singleton - The singleton to evolve into during the setup.
-     *  {bytes} initializer - The setup initializer bytes.
-     *  {uint256} nonce - A unique number associated with the user operation, preventing replay attacks by ensuring each operation is unique.
-     *  {bytes} initCodeTemplate - The packed encoding of a factory address and its factory-specific data for creating the Safe launchpad with the `initHash` parameter set to 0.
-     *  {uint256} callGasLimit - The maximum amount of gas allowed for executing the function call.
-     *  {uint256} verificationGasLimit - The maximum amount of gas allowed for the verification process.
-     *  {uint256} preVerificationGas - The amount of gas allocated for pre-verification steps before executing the main operation.
-     *  {uint256} maxFeePerGas - The maximum fee per gas that the user is willing to pay for the transaction.
-     *  {uint256} maxPriorityFeePerGas - The maximum priority fee per gas that the user is willing to pay for the transaction.
-     *  {bytes} paymasterAndData - The packed encoding of a paymaster address and its paymaster-specific data for sponsoring the user operation.
+     *  {address} signerFactory - The unique signer factory to use for creating an owner.
+     *  {bytes} signerData - The signer data to use the owner.
+     *  {address} setupTo - The contract to delegatecall during setup.
+     *  {bytes} setupData - The calldata for the setup delegatecall.
+     *  {address} fallbackHandler - The fallback handler to initialize the Safe with.
+     */
+    bytes32 private constant SAFE_INIT_TYPEHASH =
+        keccak256(
+            "SafeInit(address singleton,address signerFactory,bytes signerData,address setupTo,bytes setupData,address fallbackHandler)"
+        );
+
+    /**
+     * @notice The keccak256 hash of the EIP-712 SafeInitOp struct, representing the user operation to execute alongside initialization.
+     *  {bytes32} userOpHash - The user operation hash being executed.
      *  {uint48} validAfter - A timestamp representing from when the user operation is valid.
      *  {uint48} validUntil - A timestamp representing until when the user operation is valid, or 0 to indicated "forever".
      *  {address} entryPoint - The address of the entry point that will execute the user operation.
      */
-    bytes32 private constant SAFE_INIT_TYPEHASH =
-        keccak256(
-            "SafeInit(address singleton,bytes initializer,uint256 nonce,bytes initCodeTemplate,uint256 callGasLimit,uint256 verificationGasLimit,uint256 preVerificationGas,uint256 maxFeePerGas,uint256 maxPriorityFeePerGas,bytes paymasterAndData,uint48 validAfter,uint48 validUntil,address entryPoint)"
-        );
-
-    struct EncodedSafeInitStruct {
-        bytes32 typeHash;
-        address singleton;
-        bytes32 initializerHash;
-        uint256 nonce;
-        bytes32 initCodeTemplateHash;
-        uint256 callGasLimit;
-        uint256 verificationGasLimit;
-        uint256 preVerificationGas;
-        uint256 maxFeePerGas;
-        uint256 maxPriorityFeePerGas;
-        bytes32 paymasterAndDataHash;
-        uint48 validAfter;
-        uint48 validUntil;
-        address entryPoint;
-    }
-
-    /**
-     * @notice The keccak256 hash of the EIP-712 SafeInitOp struct, representing an ERC-4337 user operation with initialization.
-     *  {SafeInit} init - The initialization parameters.
-     *  {address} safe - The address of the safe on which the operation is performed.
-     *  {bytes} callData - The post-initialization call data to self.
-     */
     bytes32 private constant SAFE_INIT_OP_TYPEHASH =
-        keccak256(
-            "SafeInitOp(SafeInit init,address safe,bytes callData)SafeInit(address singleton,bytes initializer,uint256 nonce,bytes initCodeTemplate,uint256 callGasLimit,uint256 verificationGasLimit,uint256 preVerificationGas,uint256 maxFeePerGas,uint256 maxPriorityFeePerGas,bytes paymasterAndData,uint48 validAfter,uint48 validUntil,address entryPoint)"
-        );
+        keccak256("SafeInitOp(bytes32 userOpHash,uint48 validAfter,uint48 validUntil,address entryPoint)");
 
     address private immutable SELF;
     address public immutable SUPPORTED_ENTRYPOINT;
-
-    event LaunchpadExecutionFailed();
-    event LaunchpadInvalidSignature();
 
     constructor(address entryPoint) {
         require(entryPoint != address(0), "Invalid entry point");
@@ -78,6 +52,8 @@ contract Safe4337Launchpad is IAccount, SafeStorage {
         SELF = address(this);
         SUPPORTED_ENTRYPOINT = entryPoint;
     }
+
+    event LaunchpadExecutionFailed();
 
     modifier onlyProxy() {
         require(singleton == SELF, "Not called from proxy");
@@ -99,21 +75,55 @@ contract Safe4337Launchpad is IAccount, SafeStorage {
         }
     }
 
-    function getInitHash(UserOperation calldata userOp) external view returns (bytes32 initHash) {
-        (initHash, , ) = _getSafeInit(userOp);
+    function getOperationHash(bytes32 userOpHash, uint48 validAfter, uint48 validUntil) public view returns (bytes32 operationHash) {
+        operationHash = keccak256(_getOperationData(userOpHash, validAfter, validUntil));
     }
 
     function validateUserOp(
         UserOperation calldata userOp,
-        bytes32,
+        bytes32 userOpHash,
         uint256 missingAccountFunds
     ) external override onlyProxy onlySupportedEntryPoint returns (uint256 validationData) {
-        (bytes32 initHash, uint48 validAfter, uint48 validUntil) = _getSafeInit(userOp);
-        if (_initHash() == initHash) {
-            validationData = _packValidationData(false, validUntil, validAfter);
-        } else {
-            validationData = _packValidationData(true, validUntil, validAfter);
+        address signerFactory;
+        bytes memory signerData;
+        {
+            require(this.initializeThenUserOp.selector == bytes4(userOp.callData[:4]), "invalid user operation data");
+
+            address singleton;
+            address setupTo;
+            bytes memory setupData;
+            address fallbackHandler;
+            (singleton, signerFactory, signerData, setupTo, setupData, fallbackHandler, ) = abi.decode(
+                userOp.callData[4:],
+                (address, address, bytes, address, bytes, address, bytes)
+            );
+            bytes32 initHash = keccak256(
+                abi.encode(
+                    SAFE_INIT_TYPEHASH,
+                    singleton,
+                    signerFactory,
+                    keccak256(signerData),
+                    setupTo,
+                    keccak256(setupData),
+                    fallbackHandler
+                )
+            );
+            require(initHash == _initHash(), "invalid init hash");
         }
+
+        uint48 validAfter;
+        uint48 validUntil;
+        bytes calldata signature;
+        {
+            bytes calldata sig = userOp.signature;
+            validAfter = uint48(bytes6(sig[0:6]));
+            validUntil = uint48(bytes6(sig[6:12]));
+            signature = sig[12:];
+        }
+
+        bytes memory operationData = _getOperationData(userOpHash, validAfter, validUntil);
+        bytes4 magicValue = IUniqueSignerFactory(signerFactory).isValidSignatureFor(operationData, signature, signerData);
+        validationData = _packValidationData(magicValue != ISignatureValidator.isValidSignature.selector, validUntil, validAfter);
 
         if (missingAccountFunds > 0) {
             // solhint-disable-next-line no-inline-assembly
@@ -125,34 +135,27 @@ contract Safe4337Launchpad is IAccount, SafeStorage {
 
     function initializeThenUserOp(
         address singleton,
-        bytes calldata initializer,
-        bytes calldata callData,
-        bytes calldata signature
+        address signerFactory,
+        bytes calldata signerData,
+        address setupTo,
+        bytes calldata setupData,
+        address fallbackHandler,
+        bytes memory callData
     ) external onlySupportedEntryPoint {
         SafeStorage.singleton = singleton;
         {
-            (bool success, ) = address(this).call(initializer);
-            require(success);
+            address[] memory owners = new address[](1);
+            owners[0] = IUniqueSignerFactory(signerFactory).createSigner(signerData);
+
+            ISafe(address(this)).setup(owners, 1, setupTo, setupData, fallbackHandler, address(0), 0, payable(address(0)));
         }
 
-        // DO NOT REVERT HERE. This is a known limitation of this setup, where it is possible to spend gas money on the
-        // initial deployment of the Safe launchpad in case a malicious bundler or mempool would replace the user
-        // interaction with one whose signatures are not valid. There are two mitigations to this:
-        // 1. Introduce a tiered signing scheme (extra hard...)
-        // 2. Tie the Safe creation address to an on-chain interaction (easy, but it means that your Safe address
-        //    depends on your first action)
-        //
-        // Note that we explicitely do not revert so that the user can only be fooled once, and also to not pay for the
-        // deferred Safe setup more than once.
-
-        bytes memory operationData = _getSafeInitOpData(callData);
-        try ISafe(payable(address(this))).checkSignatures(keccak256(operationData), operationData, signature) {
-            (bool success, ) = address(this).delegatecall(callData);
-            if (!success) {
-                emit LaunchpadExecutionFailed();
+        (bool success, bytes memory returnData) = address(this).delegatecall(callData);
+        if (!success) {
+            // solhint-disable-next-line no-inline-assembly
+            assembly ("memory-safe") {
+                revert(add(returnData, 0x20), mload(returnData))
             }
-        } catch {
-            emit LaunchpadInvalidSignature();
         }
 
         _setInitHash(0);
@@ -162,69 +165,17 @@ contract Safe4337Launchpad is IAccount, SafeStorage {
         return keccak256(abi.encode(DOMAIN_SEPARATOR_TYPEHASH, block.chainid, SELF));
     }
 
-    function _getSafeInit(UserOperation calldata userOp) public view returns (bytes32 initHash, uint48 validAfter, uint48 validUntil) {
-        bytes memory initCodeTemplate = userOp.initCode;
-        {
-            bytes calldata sig = userOp.signature;
-            require(sig.length == 16, "Invalid user op signature");
-
-            validAfter = uint48(bytes6(sig[:6]));
-            validUntil = uint48(bytes6(sig[6:12]));
-
-            uint256 initHashOffset;
-            unchecked {
-                initHashOffset = uint256(uint32(bytes4(sig[12:]))) + 52;
-            }
-            require(initCodeTemplate.length >= initHashOffset, "Invalid user op init hash offset");
-
-            // solhint-disable-next-line no-inline-assembly
-            assembly {
-                let initHashPtr := add(initCodeTemplate, initHashOffset)
-                initHash := mload(initHashPtr)
-                mstore(initHashPtr, 0)
-            }
-        }
-
-        address singleton;
-        bytes32 initializerHash;
-        {
-            bytes calldata callData = userOp.callData;
-            require(bytes4(callData[:4]) == this.initializeThenUserOp.selector, "Invalid user op calldata");
-
-            bytes memory initializer;
-            (singleton, initializer) = abi.decode(callData[4:], (address, bytes));
-            initializerHash = keccak256(initializer);
-            require(_isContract(singleton), "Invalid user op singleton");
-        }
-
-        EncodedSafeInitStruct memory encodedSafeInit = EncodedSafeInitStruct({
-            typeHash: SAFE_INIT_TYPEHASH,
-            singleton: singleton,
-            initializerHash: initializerHash,
-            nonce: userOp.nonce,
-            initCodeTemplateHash: keccak256(initCodeTemplate),
-            callGasLimit: userOp.callGasLimit,
-            verificationGasLimit: userOp.verificationGasLimit,
-            preVerificationGas: userOp.preVerificationGas,
-            maxFeePerGas: userOp.maxFeePerGas,
-            maxPriorityFeePerGas: userOp.maxPriorityFeePerGas,
-            paymasterAndDataHash: keccak256(userOp.paymasterAndData),
-            validAfter: validAfter,
-            validUntil: validUntil,
-            entryPoint: SUPPORTED_ENTRYPOINT
-        });
-
-        bool initHashMatch;
-        // solhint-disable-next-line no-inline-assembly
-        assembly ("memory-safe") {
-            initHashMatch := eq(initHash, keccak256(encodedSafeInit, 448))
-        }
-        require(initHashMatch, "Invalid user op init hash");
-    }
-
-    function _getSafeInitOpData(bytes memory callData) public view returns (bytes memory) {
-        bytes32 safeOperationHash = keccak256(abi.encode(SAFE_INIT_OP_TYPEHASH, _initHash(), this, keccak256(callData)));
-        return abi.encodePacked(bytes1(0x19), bytes1(0x01), _domainSeparator(), safeOperationHash);
+    function _getOperationData(
+        bytes32 userOpHash,
+        uint48 validAfter,
+        uint48 validUntil
+    ) internal view returns (bytes memory operationData) {
+        operationData = abi.encodePacked(
+            bytes1(0x19),
+            bytes1(0x01),
+            _domainSeparator(),
+            keccak256(abi.encode(SAFE_INIT_OP_TYPEHASH, userOpHash, validAfter, validUntil, operationData))
+        );
     }
 
     function _initHash() public view returns (bytes32 value) {
