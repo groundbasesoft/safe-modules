@@ -326,16 +326,27 @@ export class Safe4337 {
     return Safe4337Operation.build(this.provider, this, action, this.globalConfig)
   }
 
-  static async withSigner(signer: string, globalConfig: GlobalConfig): Promise<Safe4337> {
+  static withSigner(signer: string, globalConfig: GlobalConfig): Safe4337 {
     const safeConfig: SafeConfig = {
       signers: [signer],
       threshold: 1,
       nonce: 0,
     }
+
     return Safe4337.withConfigs(safeConfig, globalConfig)
   }
 
-  static async withConfigs(safeConfig: SafeConfig, globalConfig: GlobalConfig): Promise<Safe4337> {
+  static withSigners(signers: string[], threshold: number, globalConfig: GlobalConfig): Safe4337 {
+    const safeConfig: SafeConfig = {
+      signers,
+      threshold,
+      nonce: 0,
+    }
+
+    return Safe4337.withConfigs(safeConfig, globalConfig)
+  }
+
+  static withConfigs(safeConfig: SafeConfig, globalConfig: GlobalConfig): Safe4337 {
     const initParams = buildInitParamsForConfig(safeConfig, globalConfig)
     return new Safe4337(initParams.safeAddress, globalConfig, safeConfig)
   }
